@@ -299,6 +299,8 @@ static void die_kernel_fault(const char *msg, unsigned long addr,
 	do_exit(SIGKILL);
 }
 
+extern void __iomem *expender_virt_addr;
+extern size_t expender_virt_size;
 static void __do_kernel_fault(unsigned long addr, unsigned int esr,
 			      struct pt_regs *regs)
 {
@@ -630,6 +632,15 @@ static int __kprobes do_translation_fault(unsigned long addr,
 {
 	if (is_ttbr0_addr(addr))
 		return do_page_fault(addr, esr, regs);
+
+	/* mb: clear the fault */
+	if (addr > (unsigned long)expender_virt_addr &&
+	    addr < ((size_t)expender_virt_addr + expender_virt_size)) {
+		pr_alert("mb: unable to handle kernel paging request at virtual address %016lx\n", addr);
+		mem_abort_decode(esr);
+		__asm__ volatile("b .\n");
+		return 0;
+	}
 
 	do_bad_area(addr, esr, regs);
 	return 0;
