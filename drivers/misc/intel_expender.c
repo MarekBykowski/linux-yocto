@@ -55,7 +55,8 @@ static int __expender_map(unsigned long addr,
 
 	/* Unmap the mapped area */
 	list_for_each_entry_safe(p, tmp, &expdr_mapped, list) {
-		unmap_kernel_range_noflush(p->addr, PAGE_SIZE);
+		/*unmap_kernel_range_noflush(p->addr, PAGE_SIZE);*/
+		unmap_kernel_range(p->addr, PAGE_SIZE);
 		list_move_tail(&p->list, &expdr_unmapped);
 	}
 
@@ -136,8 +137,7 @@ static int expender_init(void)
 			   (unsigned long)(area_expender->addr + PAGE_SIZE),
 			   area_expender->phys_addr,
 			   __pgprot(PROT_DEVICE_nGnRE));
-	unmap_kernel_range_noflush((unsigned long)area_expender->addr,
-				   PAGE_SIZE);
+	unmap_kernel_range((unsigned long)area_expender->addr, PAGE_SIZE);
 #endif
 
 #if 1
