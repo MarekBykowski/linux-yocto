@@ -20,6 +20,7 @@
 #include <linux/io.h>
 #include <linux/vmalloc.h>
 #include <asm/cacheflush.h>
+#include <linux/seq_file.h>
 
 static struct vm_struct *area_expender;
 
@@ -60,7 +61,10 @@ static int __expender_map(unsigned long addr,
 		list_move_tail(&p->list, &expdr_unmapped);
 	}
 
-	/* If the newly reqested area is on the unmapped move to the mapped */
+	/*
+	 * If the newly reqested area is on the unmapped list move it
+	 * to the mapped.
+	 */
 	list_for_each_entry_safe(p, tmp, &expdr_unmapped, list) {
 		if (p->addr == addr) {
 			list_move_tail(&p->list, &expdr_mapped);
@@ -68,14 +72,17 @@ static int __expender_map(unsigned long addr,
 		}
 	}
 
-	/* If not on the mapped, create the area and add to the list */
+	/*
+	 * If the area is not on the mapped, create it and add it to
+	 * the mapped list.
+	 */
 	if (found == false) {
 		mapped = kzalloc(sizeof(*mapped), GFP_KERNEL);
 		mapped->addr = addr;
 		list_add(&mapped->list, &expdr_mapped);
 	}
 
-	/* and map */
+	/* Map the area */
 	err = ioremap_page_range(addr, addr + PSIZE,
 				 area_expender->phys_addr,
 				 __pgprot(PROT_DEVICE_nGnRE));
@@ -114,9 +121,140 @@ int expender_map(unsigned long addr,
 	return -1;
 }
 
+/*
+ * User API to read/write from/to the area exponder exposes
+ */
+
+static unsigned long expdr_offset = 0x1000;
+
+static ssize_t expdr_offset_read(struct file *filp, char *buffer, size_t length,
+		      loff_t *offset)
+{
+	char buf[80];
+	int len = 0;
+
+	if (*offset > 0 || length < 80)
+		return 0;
+
+	len += sprintf(buf, "%lx\n", expdr_offset);
+
+	if (copy_to_user(buffer, buf, len))
+		return -EFAULT;
+
+	*offset = len;
+
+	return len;
+}
+
+static ssize_t expdr_offset_write(struct file *file, const char __user *buffer,
+		   size_t count, loff_t *ppos)
+{
+	char *input;
+	unsigned int new_expdr_offset;
+	int rc;
+	unsigned long res;
+
+	if (!buffer)
+		return -EINVAL;
+
+	input = kmalloc(count + 1, GFP_KERNEL);
+
+	if (!input)
+		return -ENOSPC;
+
+	rc = copy_from_user(input, buffer, count);
+
+	if (rc) {
+		kfree(input);
+		return -EFAULT;
+	}
+
+	input[count] = 0;
+	rc = kstrtoul(input, 0, &res);
+
+	if (rc) {
+		kfree(input);
+
+		return rc;
+	}
+
+	new_expdr_offset = (unsigned int)res;
+	expdr_offset = (unsigned int)new_expdr_offset;
+	kfree(input);
+
+	return count;
+}
+
+static const struct file_operations expdr_offset_proc_ops = {
+	.read	    = expdr_offset_read,
+	.write	    = expdr_offset_write,
+	.llseek     = noop_llseek,
+};
+
+static ssize_t expdr_value_read(struct file *filp, char *buffer, size_t length,
+		     loff_t *offset)
+{
+	char buf[80];
+	int len = 0;
+
+	if (*offset > 0 || length < 80)
+		return 0;
+
+	len += sprintf(buf, "%x\n",
+		       readl((void __iomem *)
+		       ((unsigned long)area_expender->addr + expdr_offset)));
+
+	if (copy_to_user(buffer, buf, len))
+		return -EFAULT;
+
+	*offset = len;
+
+	return len;
+}
+
+static ssize_t expdr_value_write(struct file *file, const char __user *buffer,
+		  size_t count, loff_t *ppos)
+{
+	char *input;
+	int rc;
+	unsigned int res;
+
+	input = kmalloc(count + 1, __GFP_RECLAIMABLE);
+
+	if (!input)
+		return -ENOSPC;
+
+	if (copy_from_user(input, buffer, count)) {
+		kfree(input);
+		return -EFAULT;
+	}
+
+	input[count] = '\0';
+	rc = kstrtou32(input, 0, &res);
+
+	if (rc) {
+		kfree(input);
+		return rc;
+	}
+
+	writel(res, (void __iomem *)
+	       ((unsigned long)area_expender->addr + expdr_offset));
+
+	kfree(input);
+
+	return count;
+}
+
+static const struct file_operations expdr_value_proc_ops = {
+	.read	    = expdr_value_read,
+	.write	    = expdr_value_write,
+	.llseek     = noop_llseek,
+};
+
+
 static int expender_init(void)
 {
-	unsigned long addr;
+	unsigned long addr __maybe_unused;
 	int err = 0;
 
 	phys_addr &= PAGE_MASK;
@@ -140,7 +278,7 @@ static int expender_init(void)
 	unmap_kernel_range((unsigned long)area_expender->addr, PAGE_SIZE);
 #endif
 
-#if 1
+#if 0
 {
 	int i = 0;
 
@@ -153,6 +291,15 @@ static int expender_init(void)
 	}
 }
 #endif
+	if (proc_create("driver/expdr_offset", 0200, NULL,
+			&expdr_offset_proc_ops) == NULL) {
+		pr_err("Could not create /proc/driver/expdr_offset!\n");
+		err = -EFAULT;
+	} else if (proc_create("driver/expdr_value", 0200, NULL,
+			       &expdr_value_proc_ops) == NULL) {
+		pr_err("Could not create /proc/driver/expdr_value!\n");
+		err = -EFAULT;
+	}
 
 	return err;
 }
