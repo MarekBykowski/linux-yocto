@@ -624,12 +624,17 @@ no_context:
 	return 0;
 }
 
+extern int expender_map(unsigned long addr, unsigned int esr,
+			struct pt_regs *regs);
 static int __kprobes do_translation_fault(unsigned long addr,
 					  unsigned int esr,
 					  struct pt_regs *regs)
 {
 	if (is_ttbr0_addr(addr))
 		return do_page_fault(addr, esr, regs);
+
+	if (expender_map(addr, esr, regs) == 0)
+		return 0;
 
 	do_bad_area(addr, esr, regs);
 	return 0;
