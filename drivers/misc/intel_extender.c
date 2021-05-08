@@ -23,10 +23,15 @@
 #include <linux/seq_file.h>
 
 static struct vm_struct *area_expender;
+static void __iomem *base;
 
-static phys_addr_t phys_addr = 0x0018000000ULL;
-#define PSIZE (PAGE_SIZE)
-#define VSIZE (SZ_2M)
+/* MMU and Span Extender defines */
+#define VSIZE			(SZ_2M)
+#define EXTENDER_BASE		0x90000000UL
+#define EXTENDER_SIZE		(PAGE_SIZE)
+
+#define EXTENDER_CTRL_BASE	0xF9000000UL
+#define EXTENDER_CTRL_CSR	0x2000
 
 LIST_HEAD(expdr_unmapped);
 LIST_HEAD(expdr_mapped);
@@ -36,6 +41,8 @@ struct expdr_window {
 	struct list_head list;
 };
 
+static unsigned long expdr_offset = 0x0;
+
 static int __expender_map(unsigned long addr,
 			  unsigned int esr,
 			  struct pt_regs *regs)
@@ -43,6 +50,7 @@ static int __expender_map(unsigned long addr,
 	int err = 0;
 	bool found = false;
 	struct expdr_window *mapped, *p, *tmp;
+	unsigned long offset;
 
 #if 0
 	if (false)
@@ -83,13 +91,27 @@ static int __expender_map(unsigned long addr,
 	}
 
 	/* Map the area */
-	err = ioremap_page_range(addr, addr + PSIZE,
+	err = ioremap_page_range(addr, addr + EXTENDER_SIZE,
 				 area_expender->phys_addr,
 				 __pgprot(PROT_DEVICE_nGnRE));
 	if (err) {
 		unmap_kernel_range_noflush(addr, PAGE_SIZE);
 		err = -ENOMEM;
 		goto expdr_error;
+	}
+
+	offset = addr - (unsigned long)area_expender->addr;
+	pr_info("expdr: offset %lx\n", offset);
+	/* Steer Span Extender */
+	if (offset == 0) {
+		pr_info("expdr: steer to low\n");
+		writeq(0x0, base + EXTENDER_CTRL_CSR);
+	} else if (offset == 0x1000) {
+		pr_info("expdr: steer to mid\n");
+		writeq(0x4000000000, base + EXTENDER_CTRL_CSR);
+	} else if (offset == 0x2000) {
+		pr_info("expdr: steer to high\n");
+		writeq(0x8000000000, base + EXTENDER_CTRL_CSR);
 	}
 
 {
@@ -122,10 +144,9 @@ int expender_map(unsigned long addr,
 }
 
 /*
- * User API to read/write from/to the area exponder exposes
+ * Use procfs to read/write from/to the area extender exposes
  */
 
-static unsigned long expdr_offset = 0x1000;
 
 static ssize_t expdr_offset_read(struct file *filp, char *buffer, size_t length,
 		      loff_t *offset)
@@ -174,7 +195,6 @@ static ssize_t expdr_offset_write(struct file *file, const char __user *buffer,
 
 	if (rc) {
 		kfree(input);
-
 		return rc;
 	}
 
@@ -256,10 +276,15 @@ static int expender_init(void)
 {
 	unsigned long addr __maybe_unused;
 	int err = 0;
+	phys_addr_t phys_addr = (phys_addr_t)EXTENDER_BASE;
 
 	phys_addr &= PAGE_MASK;
 	area_expender = get_vm_area(VSIZE, VM_IOREMAP | VM_NO_GUARD);
 	area_expender->phys_addr = phys_addr;
+
+	base = ioremap(EXTENDER_CTRL_BASE, SZ_2M);
+	pr_info("expdr: mapped %lx + %x to base %pS\n",
+		EXTENDER_CTRL_BASE, (unsigned)SZ_2M, base);
 
 	pr_info("expdr: reserve VA area %pS-0x%zx (size 0x%lx) from VMALLOC area 0x%lx-0x%lx\n",
 		area_expender->addr,
@@ -268,16 +293,7 @@ static int expender_init(void)
 		VMALLOC_START, VMALLOC_END);
 	pr_info("expdr: VA is reserved for PA %pap-0x%zx\n",
 		&area_expender->phys_addr,
-		(size_t)area_expender->phys_addr + PSIZE);
-
-#define TEST 0
-#if TEST
-	ioremap_page_range((unsigned long)area_expender->addr,
-			   (unsigned long)(area_expender->addr + PAGE_SIZE),
-			   area_expender->phys_addr,
-			   __pgprot(PROT_DEVICE_nGnRE));
-	unmap_kernel_range((unsigned long)area_expender->addr, PAGE_SIZE);
-#endif
+		(size_t)area_expender->phys_addr + EXTENDER_SIZE);
 
 #if 0
 {
@@ -302,6 +318,7 @@ static int expender_init(void)
 		err = -EFAULT;
 	}
 
+
 	return err;
 }
 
@@ -309,4 +326,4 @@ device_initcall(expender_init);
 
 MODULE_AUTHOR("Marek Bykowski <marek.bykowski@gmail.com>");
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Expender mapping");
+MODULE_DESCRIPTION("Extender mapping");
