@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-// Copyright (C) 2018 INTEL
+// Copyright (C) 2021 INTEL
 
-/*
- * ===========================================================================
- * ===========================================================================
- * Private
- * ===========================================================================
- * ===========================================================================
- */
+#define DEBUG
 
 #include <linux/module.h>
 #include <linux/of.h>
@@ -21,309 +15,295 @@
 #include <linux/vmalloc.h>
 #include <asm/cacheflush.h>
 #include <linux/seq_file.h>
+#include <linux/platform_device.h>
+#include <linux/of_platform.h>
+#include <linux/intel_extender.h>
 
-static struct vm_struct *area_expender;
-static void __iomem *base;
+#define EXTENDER_CTRL_CSR 0x2000
 
-/* MMU and Span Extender defines */
-#define VSIZE			(SZ_2M)
-#define EXTENDER_BASE		0x90000000UL
-#define EXTENDER_SIZE		(PAGE_SIZE)
-
-#define EXTENDER_CTRL_BASE	0xF9000000UL
-#define EXTENDER_CTRL_CSR	0x2000
-
-LIST_HEAD(expdr_unmapped);
-LIST_HEAD(expdr_mapped);
+static void __iomem *great_virt_area __ro_after_init;
 
 struct expdr_window {
 	unsigned long addr;
 	struct list_head list;
 };
 
-static unsigned long expdr_offset = 0x0;
+LIST_HEAD(extender_unmapped);
+LIST_HEAD(extender_mapped);
 
-static int __expender_map(unsigned long addr,
-			  unsigned int esr,
-			  struct pt_regs *regs)
+int extender_map(struct intel_extender *extender,
+		 unsigned long addr,
+		 unsigned int esr,
+		 struct pt_regs *regs)
 {
 	int err = 0;
-	bool found = false;
 	struct expdr_window *mapped, *p, *tmp;
 	unsigned long offset;
+	bool found = false;
+	char buf0[300], buf1[300];
+	int len0 = 0, len1 = 0;
 
-#if 0
-	if (false)
-		mem_abort_decode(esr);
-#endif
+	/*
+	 * If the mapping address isn't within the great virt area,
+	 * it means the MMU faulted not becasue of us, leave it out.
+	 */
+	if (addr < (unsigned long)extender->area_extender->addr ||
+	    addr >=((size_t)extender->area_extender->addr +
+	    extender->area_extender->size))
+		return -EFAULT;
 
-	pr_info("expdr: unable to handle paging request at VA %016lx\n", addr);
+	dev_dbg(extender->dev,
+		"unable to handle paging request at VA %016lx\n", addr);
 
-	/* Page align the mapping address */
+	/* Page mask the mapping address */
 	addr &= PAGE_MASK;
 
-	/* Unmap the mapped area */
-	list_for_each_entry_safe(p, tmp, &expdr_mapped, list) {
+	/*
+	 * Unmap the the mapped area
+	 * If the mapping address led to the MMU fault it means
+	 * it is unamapped. As there is only one area allowed to be mapped
+	 * the requested area replaces the area already mapped. That
+	 * results in the mapped moving to the unampped.
+	 */
+	list_for_each_entry_safe(p, tmp, &extender_mapped, list) {
 		/*unmap_kernel_range_noflush(p->addr, PAGE_SIZE);*/
-		unmap_kernel_range(p->addr, PAGE_SIZE);
-		list_move_tail(&p->list, &expdr_unmapped);
+		unmap_kernel_range(p->addr, extender->windowed_size);
+		list_move_tail(&p->list, &extender_unmapped);
 	}
 
 	/*
-	 * If the newly reqested area is on the unmapped list move it
-	 * to the mapped.
+	 * Check if the requested area isn't already on the unmapped.
+	 * If it is swap it around (from the unmapped to the mapped).
 	 */
-	list_for_each_entry_safe(p, tmp, &expdr_unmapped, list) {
+	list_for_each_entry_safe(p, tmp, &extender_unmapped, list) {
 		if (p->addr == addr) {
-			list_move_tail(&p->list, &expdr_mapped);
+			list_move_tail(&p->list, &extender_mapped);
 			found = true;
 		}
 	}
 
 	/*
-	 * If the area is not on the mapped, create it and add it to
-	 * the mapped list.
+	 * If the requested area isn't on the unmapped, create it and
+	 * add it to the mapped.
 	 */
 	if (found == false) {
 		mapped = kzalloc(sizeof(*mapped), GFP_KERNEL);
 		mapped->addr = addr;
-		list_add(&mapped->list, &expdr_mapped);
+		list_add(&mapped->list, &extender_mapped);
 	}
 
-	/* Map the area */
-	err = ioremap_page_range(addr, addr + EXTENDER_SIZE,
-				 area_expender->phys_addr,
+	/*
+	 * Samity check! Don't even allow calling into
+	 * ioremap_page_range() with the address and size page unaligned.
+	 */
+	BUG_ON(!PAGE_ALIGNED(extender->windowed_size) || !PAGE_ALIGNED(addr));
+
+	dev_dbg(extender->dev, "ioremap_page_range %lx-%lx\n",
+		addr, addr + extender->windowed_size);
+
+	/* The heart of the mapping */
+	err = ioremap_page_range(addr, addr + extender->windowed_size,
+				 extender->area_extender->phys_addr,
 				 __pgprot(PROT_DEVICE_nGnRE));
 	if (err) {
-		unmap_kernel_range_noflush(addr, PAGE_SIZE);
+		unmap_kernel_range_noflush(addr, extender->windowed_size);
 		err = -ENOMEM;
 		goto expdr_error;
 	}
 
-	offset = addr - (unsigned long)area_expender->addr;
-	pr_info("expdr: offset %lx\n", offset);
-	/* Steer Span Extender */
-	if (offset == 0) {
-		pr_info("expdr: steer to low\n");
-		writeq(0x0, base + EXTENDER_CTRL_CSR);
-	} else if (offset == 0x1000) {
-		pr_info("expdr: steer to mid\n");
-		writeq(0x4000000000, base + EXTENDER_CTRL_CSR);
-	} else if (offset == 0x2000) {
-		pr_info("expdr: steer to high\n");
-		writeq(0x8000000000, base + EXTENDER_CTRL_CSR);
-	}
+	/* We're interested into offset off the great virt area */
+	offset = addr - (unsigned long)extender->area_extender->addr;
+	dev_dbg(extender->dev, "offset off the great virt area %lx\n", offset);
 
-{
-	struct expdr_window *p;
+	offset &= 0xffffffff00000000;
 
-	pr_info("expdr: mapped: ");
-	list_for_each_entry(p, &expdr_mapped, list) {
-		pr_cont("%lx ", p->addr);
+	/* Steer the Span Extender */
+	dev_dbg(extender->dev, "steer Extender to %lx\n", offset);
+	writeq(offset, extender->control + EXTENDER_CTRL_CSR);
+
+	/*
+	 * Below we print the lists with the area mapped and unampped.
+	 * This must be taken out of it and accessed through some
+	 * management interface.
+	 */
+	list_for_each_entry(p, &extender_mapped, list) {
+#ifdef DEBUG
+		len0 += sprintf(buf0 + len0, "%lx ", p->addr);
+#else
+		;
+#endif
 	}
-	pr_info("expdr: unmapped: ");
-	list_for_each_entry(p, &expdr_unmapped, list) {
-		pr_cont("%lx ", p->addr);
+	list_for_each_entry(p, &extender_unmapped, list) {
+#ifdef DEBUG
+		len1 += sprintf(buf1 + len1, "%lx ", p->addr);
+#else
+		;
+#endif
 	}
-	pr_cont("\n");
-}
+	dev_dbg(extender->dev, "mapped: %s\n", buf0);
+	dev_dbg(extender->dev, "unmapped: %s\n", buf1);
 
 expdr_error:
 	return err;
 }
 
-int expender_map(unsigned long addr,
-	      unsigned int esr,
-	      struct pt_regs *regs)
+/* Pass on extra data to the child/ren */
+static const struct of_dev_auxdata intel_extender_auxdata[] = {
+	OF_DEV_AUXDATA("intel,extender-client1", 0, NULL, &great_virt_area),
+	/* put here all the extender clients */
+	{ /* sentinel */ },
+};
+
+static int intel_extender_probe(struct platform_device *pdev)
 {
-	if (addr >= (unsigned long)area_expender->addr &&
-	    addr < ((size_t)area_expender->addr + area_expender->size))
-		return __expender_map(addr, esr, regs);
+	u64 fpga_address_space[2] = {0};
+	phys_addr_t windowed_addr;
+	unsigned long virt_size, offset;
+	struct resource *res;
+	struct intel_extender *extender;
+	int ret = 0;
 
-	return -1;
-}
+	extender = devm_kzalloc(&pdev->dev, sizeof(*extender), GFP_KERNEL);
+	if (!extender) {
+		dev_err(&pdev->dev, "memory allocation failed\n");
+		return -ENOMEM;
+	}
 
-/*
- * Use procfs to read/write from/to the area extender exposes
- */
+	extender->dev = &pdev->dev;
+	platform_set_drvdata(pdev, extender);
 
+	dev_dbg(extender->dev, "init_name %s\n", dev_name(extender->dev));
 
-static ssize_t expdr_offset_read(struct file *filp, char *buffer, size_t length,
-		      loff_t *offset)
-{
-	char buf[80];
-	int len = 0;
+	/* Get extender controls */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "control");
+	extender->control = devm_ioremap(extender->dev, res->start,
+		resource_size(res));
+	if (IS_ERR(extender->control))
+		return PTR_ERR(extender->control);
 
-	if (*offset > 0 || length < 80)
-		return 0;
+	/*
+	 * Get windowed slave addr space.
+	 * The virt addr space from within the great virt area will
+	 * always get mapped to this space.
+	 */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "windowed_slave");
+	if (!res) {
+		dev_err(extender->dev, "fail to get windowed slave\n");
+		return -ENOMEM;
+	}
+	extender->windowed_size = resource_size(res);
+	extender->windowed_size = PAGE_ALIGN(extender->windowed_size);
+	if (!devm_request_mem_region(extender->dev, res->start,
+				     extender->windowed_size,
+				     dev_name(extender->dev))) {
+		dev_err(&pdev->dev, "cannot request I/O memory region");
+		return -EBUSY;
+	}
+	windowed_addr = res->start;
 
-	len += sprintf(buf, "%lx\n", expdr_offset);
-
-	if (copy_to_user(buffer, buf, len))
-		return -EFAULT;
-
-	*offset = len;
-
-	return len;
-}
-
-static ssize_t expdr_offset_write(struct file *file, const char __user *buffer,
-		   size_t count, loff_t *ppos)
-{
-	char *input;
-	unsigned int new_expdr_offset;
-	int rc;
-	unsigned long res;
-
-	if (!buffer)
+	/* Get FPGA address space */
+	if (of_property_read_u64_array(extender->dev->of_node,
+				       "fpga_address_space",
+				       fpga_address_space,
+				       ARRAY_SIZE(fpga_address_space))) {
+		dev_err(extender->dev, "failed to get fpga memory range\n");
 		return -EINVAL;
-
-	input = kmalloc(count + 1, GFP_KERNEL);
-
-	if (!input)
-		return -ENOSPC;
-
-	rc = copy_from_user(input, buffer, count);
-
-	if (rc) {
-		kfree(input);
-		return -EFAULT;
 	}
 
-	input[count] = 0;
-	rc = kstrtoul(input, 0, &res);
+	/*
+	 * We assume the sizes (and the mapping address) are PAGE aligned
+	 * but if not we will force it (based on arch/arm64/mm/ioremap.c).
+	 *
+	 * Say, you want to map a range from an address 0x1388 sized 0x1003,
+	 * or in other words from 0x1388 through 0x1388 + 0x1003 = 0x238b.
+	 * Assuming a PAGE SIZE is 0x1000 effectively we are looking for
+	 * the size of two pages, 0x2000, spanning from 0x1000 through 0x3000,
+	 * to satisfy the reqest.
+	 *
+	 * To calculate it we must calculate a PAGE offset off 0x1388,
+	 * 0x1388 & 0xfff (~PAGE MASK) = 0x388, add it to the size reqested,
+	 * 0x388 + 0x1003 = 0x138b, and PAGE ALIGN yielding 0x2000.
+	 */
+	offset = fpga_address_space[0] & ~PAGE_MASK;
+	virt_size = fpga_address_space[1] - fpga_address_space[0];
+	virt_size = PAGE_ALIGN(virt_size + offset);
 
-	if (rc) {
-		kfree(input);
-		return rc;
-	}
+	dev_dbg(extender->dev, "fpga_address_space %llx-%llx (size 0x%lx)\n",
+		fpga_address_space[0], fpga_address_space[1], virt_size);
 
-	new_expdr_offset = (unsigned int)res;
-	expdr_offset = (unsigned int)new_expdr_offset;
-	kfree(input);
+	extender->area_extender = get_vm_area(virt_size,
+					      VM_IOREMAP | VM_NO_GUARD);
 
-	return count;
-}
+	/* Register MMU fault handler */
+	extender->map_op = extender_map;
 
-static const struct file_operations expdr_offset_proc_ops = {
-	.read	    = expdr_offset_read,
-	.write	    = expdr_offset_write,
-	.llseek     = noop_llseek,
-};
+	/* Get the virt addr of the great virt area */
+	great_virt_area = extender->area_extender->addr;
 
-static ssize_t expdr_value_read(struct file *filp, char *buffer, size_t length,
-		     loff_t *offset)
-{
-	char buf[80];
-	int len = 0;
+	/* Page mask the windowed_addr */
+	extender->area_extender->phys_addr = windowed_addr &= PAGE_MASK;
 
-	if (*offset > 0 || length < 80)
-		return 0;
-
-	len += sprintf(buf, "%x\n",
-		       readl((void __iomem *)
-		       ((unsigned long)area_expender->addr + expdr_offset)));
-
-	if (copy_to_user(buffer, buf, len))
-		return -EFAULT;
-
-	*offset = len;
-
-	return len;
-}
-
-static ssize_t expdr_value_write(struct file *file, const char __user *buffer,
-		  size_t count, loff_t *ppos)
-{
-	char *input;
-	int rc;
-	unsigned int res;
-
-	input = kmalloc(count + 1, __GFP_RECLAIMABLE);
-
-	if (!input)
-		return -ENOSPC;
-
-	if (copy_from_user(input, buffer, count)) {
-		kfree(input);
-		return -EFAULT;
-	}
-
-	input[count] = '\0';
-	rc = kstrtou32(input, 0, &res);
-
-	if (rc) {
-		kfree(input);
-		return rc;
-	}
-
-	writel(res, (void __iomem *)
-	       ((unsigned long)area_expender->addr + expdr_offset));
-
-	kfree(input);
-
-	return count;
-}
-
-static const struct file_operations expdr_value_proc_ops = {
-	.read	    = expdr_value_read,
-	.write	    = expdr_value_write,
-	.llseek     = noop_llseek,
-};
-
-
-static int expender_init(void)
-{
-	unsigned long addr __maybe_unused;
-	int err = 0;
-	phys_addr_t phys_addr = (phys_addr_t)EXTENDER_BASE;
-
-	phys_addr &= PAGE_MASK;
-	area_expender = get_vm_area(VSIZE, VM_IOREMAP | VM_NO_GUARD);
-	area_expender->phys_addr = phys_addr;
-
-	base = ioremap(EXTENDER_CTRL_BASE, SZ_2M);
-	pr_info("expdr: mapped %lx + %x to base %pS\n",
-		EXTENDER_CTRL_BASE, (unsigned)SZ_2M, base);
-
-	pr_info("expdr: reserve VA area %pS-0x%zx (size 0x%lx) from VMALLOC area 0x%lx-0x%lx\n",
-		area_expender->addr,
-		(size_t)area_expender->addr + area_expender->size,
-		area_expender->size,
+	dev_dbg(extender->dev, "reserve VA area %pS-0x%zx (size 0x%lx) from VMALLOC area 0x%lx-0x%lx\n",
+		extender->area_extender->addr,
+		(size_t)extender->area_extender->addr + extender->area_extender->size,
+		extender->area_extender->size,
 		VMALLOC_START, VMALLOC_END);
-	pr_info("expdr: VA is reserved for PA %pap-0x%zx\n",
-		&area_expender->phys_addr,
-		(size_t)area_expender->phys_addr + EXTENDER_SIZE);
 
-#if 0
-{
-	int i = 0;
+	dev_dbg(extender->dev, "VA is reserved for PA %pap-0x%zx\n",
+		&extender->area_extender->phys_addr,
+		(size_t)(extender->area_extender->phys_addr +
+		extender->windowed_size));
 
-	for (; i < 1; i++) {
-		pr_info("expdr: loop %d\n", i);
-		addr = (unsigned long)area_expender->addr;
-		writel(0xdeadbeef, (void *)addr);
-		writel(0xdeadbeef, (void *)(addr + 0x3000ULL));
-		writel(0xdeadbeef, (void *)addr);
+	dev_dbg(extender->dev,
+		"of_platform_populate(): populate great virt area %pS\n",
+		great_virt_area);
+
+	ret = of_platform_populate(extender->dev->of_node, NULL,
+				   intel_extender_auxdata, &pdev->dev);
+	if (ret) {
+		dev_err(extender->dev,
+			"failed to populate the great virt area\n");
+		return ret;
 	}
-}
+
+#if 1
+	dev_dbg(extender->dev, "readl(%px)\n",
+		extender->area_extender->addr);
+	(void)readl(extender->area_extender->addr);
+
+	dev_dbg(extender->dev, "readl(%px)\n",
+		extender->area_extender->addr + 0x4000000000);
+	(void)readl(extender->area_extender->addr + 0x4000000000);
+
+	dev_dbg(extender->dev, "readl(%px)\n",
+		extender->area_extender->addr + 0x8000000000);
+	(void)readl(extender->area_extender->addr + 0x8000000000);
 #endif
-	if (proc_create("driver/expdr_offset", 0200, NULL,
-			&expdr_offset_proc_ops) == NULL) {
-		pr_err("Could not create /proc/driver/expdr_offset!\n");
-		err = -EFAULT;
-	} else if (proc_create("driver/expdr_value", 0200, NULL,
-			       &expdr_value_proc_ops) == NULL) {
-		pr_err("Could not create /proc/driver/expdr_value!\n");
-		err = -EFAULT;
-	}
-
-
-	return err;
+	return ret;
 }
 
-device_initcall(expender_init);
+/* Compatible string */
+static const struct of_device_id intel_extender_matches[] = {
+	{ .compatible = "intel,extender", },
+	{},
+};
+MODULE_DEVICE_TABLE(of, intel_extender_matches);
 
+static struct platform_driver intel_extender_driver = {
+	.driver = {
+		   .name = "intel-extender",
+		   .of_match_table = intel_extender_matches,
+		   .owner = THIS_MODULE,
+		  },
+	.probe = intel_extender_probe,
+};
+
+static int __init extender_init(void)
+{
+	return platform_driver_register(&intel_extender_driver);
+}
+
+device_initcall(extender_init);
 MODULE_AUTHOR("Marek Bykowski <marek.bykowski@gmail.com>");
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Extender mapping");
+MODULE_DESCRIPTION("Memory Span Extender");
