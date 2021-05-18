@@ -149,7 +149,7 @@ expdr_error:
 
 /* Pass on extra data to the child/ren */
 static const struct of_dev_auxdata intel_extender_auxdata[] = {
-	OF_DEV_AUXDATA("intel,extender-client1", 0, NULL, &great_virt_area),
+	OF_DEV_AUXDATA("intel,extender-client", 0, NULL, &great_virt_area),
 	/* put here all the extender clients */
 	{ /* sentinel */ },
 };
@@ -172,8 +172,6 @@ static int intel_extender_probe(struct platform_device *pdev)
 	extender->dev = &pdev->dev;
 	platform_set_drvdata(pdev, extender);
 
-	dev_dbg(extender->dev, "init_name %s\n", dev_name(extender->dev));
-
 	/* Get extender controls */
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "control");
 	extender->control = devm_ioremap(extender->dev, res->start,
@@ -183,8 +181,7 @@ static int intel_extender_probe(struct platform_device *pdev)
 
 	/*
 	 * Get windowed slave addr space.
-	 * The virt addr space from within the great virt area will
-	 * always get mapped to this space.
+	 * A subset of the great virt area space always maps to it.
 	 */
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "windowed_slave");
 	if (!res) {
@@ -214,15 +211,15 @@ static int intel_extender_probe(struct platform_device *pdev)
 	 * We assume the sizes (and the mapping address) are PAGE aligned
 	 * but if not we will force it (based on arch/arm64/mm/ioremap.c).
 	 *
-	 * Say, you want to map a range from an address 0x1388 sized 0x1003,
-	 * or in other words from 0x1388 through 0x1388 + 0x1003 = 0x238b.
-	 * Assuming a PAGE SIZE is 0x1000 effectively we are looking for
-	 * the size of two pages, 0x2000, spanning from 0x1000 through 0x3000,
-	 * to satisfy the reqest.
+	 * The alignment is going around: say, you want to map a range
+	 * from an address 0x1388 sized 0x1003, or in other words from
+	 * 0x1388 through 0x1388 + 0x1003 = 0x238b. Assuming a PAGE SIZE is
+	 * 0x1000 effectively we are looking for the size of two pages,
+	 * 0x2000, spanning from 0x1000 through 0x3000, to satisfy the reqest.
 	 *
 	 * To calculate it we must calculate a PAGE offset off 0x1388,
 	 * 0x1388 & 0xfff (~PAGE MASK) = 0x388, add it to the size reqested,
-	 * 0x388 + 0x1003 = 0x138b, and PAGE ALIGN yielding 0x2000.
+	 * 0x388 + 0x1003 = 0x138b, and PAGE ALIGN resulting in 0x2000.
 	 */
 	offset = fpga_address_space[0] & ~PAGE_MASK;
 	virt_size = fpga_address_space[1] - fpga_address_space[0];
@@ -259,14 +256,16 @@ static int intel_extender_probe(struct platform_device *pdev)
 		great_virt_area);
 
 	ret = of_platform_populate(extender->dev->of_node, NULL,
-				   intel_extender_auxdata, &pdev->dev);
+				   intel_extender_auxdata, extender->dev);
 	if (ret) {
 		dev_err(extender->dev,
 			"failed to populate the great virt area\n");
 		return ret;
 	}
 
-#if 1
+#define TEST_EXTENDER_HERE_INSTEAD_OF_FROM_CLIENT 0
+
+#if TEST_EXTENDER_HERE_INSTEAD_OF_FROM_CLIENT
 	dev_dbg(extender->dev, "readl(%px)\n",
 		extender->area_extender->addr);
 	(void)readl(extender->area_extender->addr);
@@ -279,6 +278,7 @@ static int intel_extender_probe(struct platform_device *pdev)
 		extender->area_extender->addr + 0x8000000000);
 	(void)readl(extender->area_extender->addr + 0x8000000000);
 #endif
+
 	return ret;
 }
 

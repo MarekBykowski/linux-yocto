@@ -101,6 +101,10 @@
 			      <0x90000000 0xfffffff>; /*Address span extender windowed slave*/
 			reg-names = "control", "windowed_slave";
 			fpga_address_space = <0x0000000 0x000000000 0x00000080 0x10000000>;
+
+			extenderclient: extenderclient {
+				compatible = "intel,extender-client";
+			};
 		};
 
 		clkmgr: clock-controller@ffd10000 {
