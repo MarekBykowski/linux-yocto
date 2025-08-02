@@ -445,6 +445,8 @@ ALT_UP_B(.L0_\@)
  * you cannot return to the original mode.
  */
 .macro safe_svcmode_maskall reg:req
+	@mb:
+	1: b 1b
 #if __LINUX_ARM_ARCH__ >= 6 && !defined(CONFIG_CPU_V7M)
 	mrs	\reg , cpsr
 	eor	\reg, \reg, #HYP_MODE
